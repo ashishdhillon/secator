@@ -1574,15 +1574,25 @@ class Runner:
 		A runner that accepts URL inputs (``url`` in its ``input_types``, e.g. a workflow
 		or trufflehog) handles the remote source itself and is left untouched; so is one
 		that accepts any type. Best-effort: a clone failure leaves the input as-is so
-		validation (or the tool) reports it. The token comes from the ``git_token`` run-opt
-		only, and is used only when every git input points at the same host, so a token
-		meant for one host is never sent to another.
+		validation (or the tool) reports it.
+
+		Private repos: the ``git_token`` run-opt is pinned to the host named by the
+		``git_token_host`` run-opt (a bare hostname, e.g. ``github.com``). It is sent only
+		to https git inputs whose host equals it exactly (case-insensitive; no subdomain or
+		suffix match, any port). Inputs on other hosts clone without it. A token without
+		``git_token_host`` raises ``ValueError``: no host is ever inferred from the inputs,
+		which come from the caller.
 		"""
 		import uuid
 		from secator.definitions import URL
 		from secator.sources import (
-			clone_git_repo, git_url_host, is_archive_url, is_gcs_url, is_git_url, resolve_gcs_archive,
+			clone_git_repo, git_url_host, is_archive_url, is_gcs_url, is_git_url, normalize_git_host,
+			resolve_gcs_archive,
 		)
+		token = self.run_opts.get('git_token')
+		token_host = normalize_git_host(self.run_opts.get('git_token_host'))
+		if token and not token_host:
+			raise ValueError('git_token requires git_token_host (the host the token belongs to, e.g. github.com)')
 		if not self.inputs:
 			return
 		input_types = getattr(self.config, 'input_types', None)
@@ -1594,14 +1604,6 @@ class Runner:
 		# Clone a git URL only for a task that does NOT accept url inputs itself (grype,
 		# trivy, gitleaks); a task that accepts url (e.g. trufflehog) clones natively.
 		clones_git = bool(input_types) and URL not in input_types
-		token = self.run_opts.get('git_token')
-		if token and clones_git:
-			hosts = {git_url_host(inp) for inp in self.inputs if is_git_url(inp)}
-			if len(hosts) > 1:
-				self._print(Warning(message=(
-					f'Not using git_token: git inputs span several hosts ({", ".join(sorted(map(str, hosts)))}); '
-					'run one host per runner to clone private repos')), rich=True)
-				token = None
 		# A unique sub-dir per resolve: sibling tasks of a workflow share one reports folder,
 		# so a fixed path would let concurrent tasks clobber each other's checkout.
 		resolved = []
@@ -1619,7 +1621,14 @@ class Runner:
 					resolved.append(inp)
 			elif clones_git and is_git_url(inp):
 				try:
-					path = clone_git_repo(inp, dest, token=token)
+					inp_token = None
+					if token and git_url_host(inp) == token_host:
+						if inp.strip().lower().startswith('https://'):
+							inp_token = token
+						else:
+							self._print(Warning(message=(
+								f'Not sending git_token to {token_host}: input is not https, cloning without it')), rich=True)
+					path = clone_git_repo(inp, dest, token=inp_token)
 					self._print(Info(message=f'Cloned source to {path}'), rich=True)
 					resolved.append(path)
 				except Exception as e:  # noqa: BLE001 - never crash init over a clone

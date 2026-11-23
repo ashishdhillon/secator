@@ -75,14 +75,58 @@ class TestSources(unittest.TestCase):
 			Runner._resolve_sources(fake)
 		return fake, clone
 
-	def test_token_used_for_single_host(self):
-		_, clone = self._resolve(['https://github.com/a/x.git', 'https://github.com/b/y.git'], git_token='T')
-		self.assertEqual([c.kwargs['token'] for c in clone.call_args_list], ['T', 'T'])
+	def _tokens(self, clone):
+		return [c.kwargs['token'] for c in clone.call_args_list]
 
-	def test_token_dropped_when_inputs_span_hosts(self):
-		fake, clone = self._resolve(['https://github.com/a/x.git', 'https://other.example/b/y.git'], git_token='T')
-		self.assertEqual([c.kwargs['token'] for c in clone.call_args_list], [None, None])
+	def test_token_sent_to_matching_host(self):
+		_, clone = self._resolve(
+			['https://github.com/a/x.git', 'https://GitHub.com/b/y.git'], git_token='T', git_token_host='github.com')
+		self.assertEqual(self._tokens(clone), ['T', 'T'])
+
+	def test_token_host_is_case_insensitive(self):
+		_, clone = self._resolve(['https://github.com/a/x.git'], git_token='T', git_token_host='GitHub.COM')
+		self.assertEqual(self._tokens(clone), ['T'])
+
+	def test_token_not_sent_to_other_host(self):
+		_, clone = self._resolve(['https://gitlab.com/a/x.git'], git_token='T', git_token_host='github.com')
+		self.assertEqual(self._tokens(clone), [None])
+
+	def test_token_no_subdomain_or_suffix_match(self):
+		_, clone = self._resolve(
+			['https://api.github.com/a/x.git', 'https://evilgithub.com/a/x.git', 'https://github.com.evil.io/a/x.git'],
+			git_token='T', git_token_host='github.com')
+		self.assertEqual(self._tokens(clone), [None, None, None])
+
+	def test_token_mixed_inputs(self):
+		_, clone = self._resolve(
+			['https://github.com/a/x.git', 'https://gitlab.com/b/y.git', 'https://github.com/c/z.git'],
+			git_token='T', git_token_host='github.com')
+		self.assertEqual(self._tokens(clone), ['T', None, 'T'])
+
+	def test_token_not_sent_over_http_on_matching_host(self):
+		fake, clone = self._resolve(
+			['http://git.example.com/a/x.git', 'git@git.example.com:a/x.git'],
+			git_token='S3CR3T', git_token_host='git.example.com')
+		self.assertEqual(self._tokens(clone), [None, None])
 		fake._print.assert_called()
+		self.assertNotIn('S3CR3T', str(fake._print.call_args_list))  # never logged
+
+	def test_token_without_host_is_refused(self):
+		with self.assertRaisesRegex(ValueError, 'git_token_host'):
+			self._resolve(['https://github.com/a/x.git'], git_token='T')
+
+	def test_host_without_token_clones_unauthenticated(self):
+		_, clone = self._resolve(['https://github.com/a/x.git'], git_token_host='github.com')
+		self.assertEqual(self._tokens(clone), [None])
+
+	def test_normalize_git_host(self):
+		from secator.sources import normalize_git_host
+		self.assertIsNone(normalize_git_host(None))
+		self.assertIsNone(normalize_git_host(''))
+		self.assertEqual(normalize_git_host(' GitHub.com. '), 'github.com')
+		for bad in ['https://github.com', 'github.com/org', 'github.com:443', 'user@github.com', '*.github.com', 'a..b']:
+			with self.assertRaises(ValueError, msg=bad):
+				normalize_git_host(bad)
 
 	def test_no_env_token_fallback(self):
 		with mock.patch.dict('os.environ', {'SECATOR_GIT_TOKEN': 'ENV'}):
