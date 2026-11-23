@@ -1,10 +1,13 @@
 """Source resolution helpers (no network)."""
-import base64
+import os
+import shutil
+import subprocess
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from secator.sources import _repo_slug, _token_auth_env, clone_git_repo, git_url_host, is_git_url
+from secator.sources import _repo_slug, clone_git_repo, is_git_url, redact_url_credentials, strip_url_credentials
 
 
 class TestSources(unittest.TestCase):
@@ -32,35 +35,82 @@ class TestSources(unittest.TestCase):
 		self.assertEqual(_repo_slug('https://gitlab.com/g/p/'), 'p')
 		self.assertEqual(_repo_slug('git@github.com:o/weird name!.git'), 'weird_name_')
 
-	def test_token_auth_env_scoped_to_origin(self):
-		env = _token_auth_env('https://ghe.acme.internal:8443/org/repo.git', 'SECRET')
-		self.assertEqual(env['GIT_CONFIG_KEY_0'], 'http.https://ghe.acme.internal:8443/.extraHeader')
-		self.assertEqual(env['GIT_CONFIG_VALUE_0'], 'Authorization: Basic ' + base64.b64encode(b'SECRET:').decode())
-		env = _token_auth_env('https://gitlab.com/g/p.git', 'oauth2:SECRET')
-		self.assertEqual(env['GIT_CONFIG_VALUE_0'], 'Authorization: Basic ' + base64.b64encode(b'oauth2:SECRET').decode())
+	def test_redact_url_credentials(self):
+		self.assertEqual(
+			redact_url_credentials('https://user:S3CR3T@github.com/o/r.git'), 'https://***@github.com/o/r.git')
+		self.assertEqual(redact_url_credentials('https://S3CR3T@gitlab.com/g/p'), 'https://***@gitlab.com/g/p')
+		self.assertEqual(
+			redact_url_credentials("fatal: could not read from 'https://u:S3CR3T@h.example/o/r' and http://a:b@x/y"),
+			"fatal: could not read from 'https://***@h.example/o/r' and http://***@x/y")
+		self.assertEqual(redact_url_credentials(RuntimeError('https://u:p@h/x')), 'https://***@h/x')
+		for clean in ['https://github.com/o/r', 'git@github.com:o/r.git', '/tmp/code', 'mail me@host.com']:
+			self.assertEqual(redact_url_credentials(clean), clean)
 
-	def test_clone_keeps_token_out_of_argv(self):
+	def test_strip_url_credentials(self):
+		self.assertEqual(strip_url_credentials('https://user:S3CR3T@github.com/o/r.git'), 'https://github.com/o/r.git')
+		self.assertEqual(strip_url_credentials('https://github.com/o/r.git'), 'https://github.com/o/r.git')
+
+	def test_is_git_url_with_userinfo(self):
+		self.assertTrue(is_git_url('https://user:S3CR3T@github.com/o/r'))
+		self.assertTrue(is_git_url('https://S3CR3T@ghe.acme.internal/org/repo.git'))
+		self.assertEqual(_repo_slug('https://user:S3CR3T@github.com/o/r.git'), 'r')
+
+	def test_clone_with_userinfo(self):
+		url = 'https://user:S3CR3T@github.com/o/r.git'
 		with mock.patch('secator.sources.subprocess.run') as run:
 			run.return_value = SimpleNamespace(returncode=0, stderr='')
-			clone_git_repo('https://github.com/o/r.git', self._tmp(), token='SECRET')
-		args, kwargs = run.call_args
-		self.assertNotIn('SECRET', ' '.join(args[0]))
-		self.assertIn('http.https://github.com/.extraHeader', kwargs['env'].values())
+			path = clone_git_repo(url, self._tmp())
+		clone_call, set_url_call = run.call_args_list
+		# git gets the credentialed URL to clone ...
+		self.assertEqual(clone_call.args[0][-2:], [url, path])
+		self.assertEqual(clone_call.kwargs['env']['GIT_TERMINAL_PROMPT'], '0')
+		# ... then the credentials are dropped from the clone's .git/config.
+		self.assertEqual(
+			set_url_call.args[0], ['git', '-C', path, 'remote', 'set-url', 'origin', 'https://github.com/o/r.git'])
 
-	def test_clone_refuses_token_over_plain_http(self):
+	def test_clone_without_userinfo_skips_set_url(self):
 		with mock.patch('secator.sources.subprocess.run') as run:
-			with self.assertRaises(RuntimeError):
-				clone_git_repo('http://git.example.com/o/r.git', self._tmp(), token='SECRET')
-		run.assert_not_called()
+			run.return_value = SimpleNamespace(returncode=0, stderr='')
+			clone_git_repo('https://github.com/o/r.git', self._tmp())
+		self.assertEqual(run.call_count, 1)
 
-	def test_git_url_host(self):
-		self.assertEqual(git_url_host('https://GitHub.com/o/r'), 'github.com')
-		self.assertEqual(git_url_host('git@gitlab.com:o/r.git'), 'gitlab.com')
-		self.assertEqual(git_url_host('ssh://git@host.example/o/r'), 'host.example')
+	def test_clone_error_redacts_credentials(self):
+		url = 'https://user:S3CR3T@github.com/o/r.git'
+		with mock.patch('secator.sources.subprocess.run') as run:
+			run.return_value = SimpleNamespace(returncode=128, stderr=f"fatal: repository '{url}' not found")
+			with self.assertRaises(RuntimeError) as ctx:
+				clone_git_repo(url, self._tmp())
+		self.assertNotIn('S3CR3T', str(ctx.exception))
+		self.assertIn('https://***@github.com/o/r.git', str(ctx.exception))
+
+	def test_clone_timeout_redacts_credentials(self):
+		url = 'https://user:S3CR3T@github.com/o/r.git'
+		with mock.patch('secator.sources.subprocess.run', side_effect=subprocess.TimeoutExpired(['git', 'clone', url], 1)):
+			with self.assertRaises(RuntimeError) as ctx:
+				clone_git_repo(url, self._tmp(), timeout=1)
+		self.assertNotIn('S3CR3T', str(ctx.exception))
+		self.assertIsNone(ctx.exception.__cause__)
+		self.assertTrue(ctx.exception.__suppress_context__)
+
+	def test_clone_real_repo_strips_credentials_from_git_config(self):
+		"""End-to-end against a local bare repo: userinfo is accepted and not persisted."""
+		if not shutil.which('git'):
+			self.skipTest('git not installed')
+		src = self._tmp()
+		env = {
+			**os.environ,
+			'GIT_AUTHOR_NAME': 'a', 'GIT_AUTHOR_EMAIL': 'a@b', 'GIT_COMMITTER_NAME': 'a', 'GIT_COMMITTER_EMAIL': 'a@b',
+		}
+		subprocess.run(['git', 'init', '-q', src], check=True, env=env)
+		subprocess.run(['git', '-C', src, 'commit', '-q', '--allow-empty', '-m', 'x'], check=True, env=env)
+		# file:// ignores userinfo, so this exercises the real clone + set-url path offline.
+		path = clone_git_repo(f'file://user:S3CR3T@{src}', self._tmp())
+		with open(f'{path}/.git/config') as f:
+			config = f.read()
+		self.assertNotIn('S3CR3T', config)
+		self.assertIn(f'url = file://{src}', config)
 
 	def _tmp(self):
-		import shutil
-		import tempfile
 		d = tempfile.mkdtemp()
 		self.addCleanup(shutil.rmtree, d, ignore_errors=True)
 		return d
@@ -75,70 +125,38 @@ class TestSources(unittest.TestCase):
 			Runner._resolve_sources(fake)
 		return fake, clone
 
-	def _tokens(self, clone):
-		return [c.kwargs['token'] for c in clone.call_args_list]
+	def test_resolve_clones_userinfo_url_and_redacts_messages(self):
+		url = 'https://user:S3CR3T@github.com/a/x.git'
+		fake, clone = self._resolve([url, '/local/path'])
+		self.assertEqual(clone.call_args.args[0], url)
+		self.assertEqual(fake.inputs, ['/cloned', '/local/path'])
+		printed = str(fake._print.call_args_list)
+		self.assertNotIn('S3CR3T', printed)
+		self.assertIn('https://***@github.com/a/x.git', printed)
 
-	def test_token_sent_to_matching_host(self):
-		_, clone = self._resolve(
-			['https://github.com/a/x.git', 'https://GitHub.com/b/y.git'], git_token='T', git_token_host='github.com')
-		self.assertEqual(self._tokens(clone), ['T', 'T'])
+	def test_resolve_clone_failure_redacts_warning(self):
+		from secator.runners._base import Runner
+		url = 'https://user:S3CR3T@github.com/a/x.git'
+		fake = SimpleNamespace(
+			inputs=[url], run_opts={}, reports_folder=self._tmp(), _print=mock.Mock(),
+			config=SimpleNamespace(type='task', input_types=['path']),
+		)
+		with mock.patch('secator.sources.clone_git_repo', side_effect=RuntimeError(f'boom {url}')):
+			Runner._resolve_sources(fake)
+		self.assertEqual(fake.inputs, [url])  # left as-is for validation to report
+		printed = str(fake._print.call_args_list)
+		self.assertNotIn('S3CR3T', printed)
+		self.assertIn('https://***@github.com/a/x.git', printed)
 
-	def test_token_host_is_case_insensitive(self):
-		_, clone = self._resolve(['https://github.com/a/x.git'], git_token='T', git_token_host='GitHub.COM')
-		self.assertEqual(self._tokens(clone), ['T'])
-
-	def test_token_not_sent_to_other_host(self):
-		_, clone = self._resolve(['https://gitlab.com/a/x.git'], git_token='T', git_token_host='github.com')
-		self.assertEqual(self._tokens(clone), [None])
-
-	def test_token_no_subdomain_or_suffix_match(self):
-		_, clone = self._resolve(
-			['https://api.github.com/a/x.git', 'https://evilgithub.com/a/x.git', 'https://github.com.evil.io/a/x.git'],
-			git_token='T', git_token_host='github.com')
-		self.assertEqual(self._tokens(clone), [None, None, None])
-
-	def test_token_mixed_inputs(self):
-		_, clone = self._resolve(
-			['https://github.com/a/x.git', 'https://gitlab.com/b/y.git', 'https://github.com/c/z.git'],
-			git_token='T', git_token_host='github.com')
-		self.assertEqual(self._tokens(clone), ['T', None, 'T'])
-
-	def test_token_not_sent_over_http_on_matching_host(self):
-		fake, clone = self._resolve(
-			['http://git.example.com/a/x.git', 'git@git.example.com:a/x.git'],
-			git_token='S3CR3T', git_token_host='git.example.com')
-		self.assertEqual(self._tokens(clone), [None, None])
-		fake._print.assert_called()
-		self.assertNotIn('S3CR3T', str(fake._print.call_args_list))  # never logged
-
-	def test_token_without_host_is_refused(self):
-		with self.assertRaisesRegex(ValueError, 'git_token_host'):
-			self._resolve(['https://github.com/a/x.git'], git_token='T')
-
-	def test_host_without_token_clones_unauthenticated(self):
-		_, clone = self._resolve(['https://github.com/a/x.git'], git_token_host='github.com')
-		self.assertEqual(self._tokens(clone), [None])
-
-	def test_normalize_git_host(self):
-		from secator.sources import normalize_git_host
-		self.assertIsNone(normalize_git_host(None))
-		self.assertIsNone(normalize_git_host(''))
-		self.assertEqual(normalize_git_host(' GitHub.com. '), 'github.com')
-		for bad in ['https://github.com', 'github.com/org', 'github.com:443', 'user@github.com', '*.github.com', 'a..b']:
-			with self.assertRaises(ValueError, msg=bad):
-				normalize_git_host(bad)
-
-	def test_no_env_token_fallback(self):
-		with mock.patch.dict('os.environ', {'SECATOR_GIT_TOKEN': 'ENV'}):
-			_, clone = self._resolve(['https://github.com/a/x.git'])
-		self.assertIsNone(clone.call_args.kwargs['token'])
-
-	def test_git_token_is_redacted(self):
-		from secator.runners._base import REDACTED_OPT_VALUE, Runner
-		fake = SimpleNamespace(run_opts={'git_token': 'T', 'depth': 1}, sensitive_opt_names=set())
-		opts = Runner.resolved_opts.fget(fake)
-		self.assertEqual(opts['git_token'], REDACTED_OPT_VALUE)
-		self.assertEqual(opts['depth'], 1)
+	def test_resolve_skips_url_accepting_task(self):
+		from secator.runners._base import Runner
+		fake = SimpleNamespace(
+			inputs=['https://github.com/a/x.git'], run_opts={}, reports_folder=self._tmp(), _print=mock.Mock(),
+			config=SimpleNamespace(type='task', input_types=['url', 'path']),
+		)
+		with mock.patch('secator.sources.clone_git_repo') as clone:
+			Runner._resolve_sources(fake)
+		clone.assert_not_called()
 
 	def test_gcs_and_archive_detection(self):
 		from secator.sources import is_gcs_url, is_archive_url

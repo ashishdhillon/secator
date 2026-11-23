@@ -51,9 +51,6 @@ VALIDATORS = ['validate_input', 'validate_item']
 # serialized/printed runner state (see Runner.sensitive_opt_names).
 REDACTED_OPT_VALUE = '[REDACTED]'
 
-# Runner-level secret options that no task definition declares, always redacted.
-RUNNER_SENSITIVE_OPTS = {'git_token'}
-
 
 def format_runner_name(runner):
 	"""Format runner name."""
@@ -366,7 +363,7 @@ class Runner:
 	@property
 	def resolved_opts(self):
 		opts = {k: v for k, v in self.run_opts.items() if v is not None and not k.startswith('print_') and not k.endswith('_') and k != 'env'}  # noqa: E501
-		sensitive = self.sensitive_opt_names | RUNNER_SENSITIVE_OPTS
+		sensitive = self.sensitive_opt_names
 		if sensitive:
 			opts = {k: (REDACTED_OPT_VALUE if (k in sensitive and v) else v) for k, v in opts.items()}
 		return opts
@@ -1576,23 +1573,15 @@ class Runner:
 		that accepts any type. Best-effort: a clone failure leaves the input as-is so
 		validation (or the tool) reports it.
 
-		Private repos: the ``git_token`` run-opt is pinned to the host named by the
-		``git_token_host`` run-opt (a bare hostname, e.g. ``github.com``). It is sent only
-		to https git inputs whose host equals it exactly (case-insensitive; no subdomain or
-		suffix match, any port). Inputs on other hosts clone without it. A token without
-		``git_token_host`` raises ``ValueError``: no host is ever inferred from the inputs,
-		which come from the caller.
+		Private repos take their credentials in the input URL itself
+		(``https://user:token@host/org/repo``). They are redacted from every message printed
+		here and stripped from the clone's ``.git/config``.
 		"""
 		import uuid
 		from secator.definitions import URL
 		from secator.sources import (
-			clone_git_repo, git_url_host, is_archive_url, is_gcs_url, is_git_url, normalize_git_host,
-			resolve_gcs_archive,
+			clone_git_repo, is_archive_url, is_gcs_url, is_git_url, redact_url_credentials, resolve_gcs_archive,
 		)
-		token = self.run_opts.get('git_token')
-		token_host = normalize_git_host(self.run_opts.get('git_token_host'))
-		if token and not token_host:
-			raise ValueError('git_token requires git_token_host (the host the token belongs to, e.g. github.com)')
 		if not self.inputs:
 			return
 		input_types = getattr(self.config, 'input_types', None)
@@ -1621,18 +1610,11 @@ class Runner:
 					resolved.append(inp)
 			elif clones_git and is_git_url(inp):
 				try:
-					inp_token = None
-					if token and git_url_host(inp) == token_host:
-						if inp.strip().lower().startswith('https://'):
-							inp_token = token
-						else:
-							self._print(Warning(message=(
-								f'Not sending git_token to {token_host}: input is not https, cloning without it')), rich=True)
-					path = clone_git_repo(inp, dest, token=inp_token)
-					self._print(Info(message=f'Cloned source to {path}'), rich=True)
+					path = clone_git_repo(inp, dest)
+					self._print(Info(message=f'Cloned source {redact_url_credentials(inp)} to {path}'), rich=True)
 					resolved.append(path)
 				except Exception as e:  # noqa: BLE001 - never crash init over a clone
-					self._print(Warning(message=f'Could not clone source: {e}'), rich=True)
+					self._print(Warning(message=f'Could not clone source: {redact_url_credentials(e)}'), rich=True)
 					resolved.append(inp)
 			else:
 				resolved.append(inp)

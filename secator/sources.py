@@ -3,12 +3,11 @@
 A task that only accepts a local path (grype, trivy, gitleaks, ...) can't scan a repo
 URL directly. This clones the repo shallowly to a local directory so the tool runs on
 it. Tasks that handle remote URLs themselves (``URL`` in ``input_types``, e.g.
-trufflehog) are left to do so. Optional token auth for private https repos: the token
-is pinned to one host by the caller (``git_token_host``) and passed to git through its
-environment as an auth header scoped to that https origin, so it never appears in the
-process arguments or in the clone's ``.git/config``.
+trufflehog) are left to do so. A private repo is reached by putting the credentials in
+the input URL itself (``https://user:token@host/org/repo``): they are stripped from the
+clone's ``.git/config`` after cloning and redacted from every message (see
+``redact_url_credentials``).
 """
-import base64
 import os
 import re
 import shutil
@@ -43,55 +42,30 @@ def _repo_slug(url):
 	return re.sub(r'[^A-Za-z0-9._-]', '_', name) or 'repo'
 
 
-def git_url_host(url):
-	"""Host a git URL points at (``None`` if it can't be parsed)."""
-	s = url.strip()
-	if s.startswith('git@'):  # scp-like ssh syntax: git@host:owner/repo
-		return s[len('git@'):].split(':', 1)[0].lower() or None
-	try:
-		return (urlparse(s).hostname or '').lower() or None
-	except ValueError:
-		return None
+# ``scheme://userinfo@`` -- the userinfo (``user``, ``token`` or ``user:token``) is a secret.
+_URL_USERINFO_RE = re.compile(r'([A-Za-z][A-Za-z0-9+.-]*://)[^/\s@]+@')
 
 
-def normalize_git_host(host):
-	"""Normalize a ``git_token_host`` value to a bare lowercase hostname (``None`` if unset).
-
-	Raises ``ValueError`` for anything that is not a bare hostname (a scheme, path, port,
-	user or wildcard), so the host a token is pinned to is never ambiguous.
-	"""
-	if host is None or (isinstance(host, str) and not host.strip()):
-		return None
-	if not isinstance(host, str) or not re.fullmatch(r'[A-Za-z0-9.-]+', host.strip()) or '..' in host:
-		raise ValueError('git_token_host must be a bare hostname, e.g. github.com')
-	return host.strip().lower().rstrip('.')
+def redact_url_credentials(text):
+	"""Replace the userinfo of every ``scheme://user:pass@host`` URL in ``text`` with ``***``."""
+	if not isinstance(text, str):
+		text = str(text)
+	return _URL_USERINFO_RE.sub(r'\1***@', text)
 
 
-def _token_auth_env(url, token):
-	"""Git env config sending ``token`` as Basic auth, only to ``url``'s https origin.
-
-	``token`` is either a bare token (sent as the username, as git does for
-	``https://<token>@host``) or ``user:token`` for hosts that need a specific username.
-	"""
-	u = urlparse(url)
-	origin = f'https://{u.hostname}' + (f':{u.port}' if u.port else '') + '/'
-	cred = token if ':' in token else f'{token}:'
-	header = 'Authorization: Basic ' + base64.b64encode(cred.encode()).decode()
-	return {
-		'GIT_CONFIG_COUNT': '1',
-		'GIT_CONFIG_KEY_0': f'http.{origin}.extraHeader',
-		'GIT_CONFIG_VALUE_0': header,
-	}
+def strip_url_credentials(url):
+	"""``url`` without its userinfo (``https://user:tok@host/x`` -> ``https://host/x``)."""
+	return _URL_USERINFO_RE.sub(r'\1', url)
 
 
-def clone_git_repo(url, dest_folder, token=None, depth=1, timeout=300):
+def clone_git_repo(url, dest_folder, depth=1, timeout=300):
 	"""Shallow-clone ``url`` into ``dest_folder`` and return the local path.
 
 	Args:
-		url (str): Repository URL (https, or ssh via an agent).
+		url (str): Repository URL (https, or ssh via an agent). A private https repo takes
+			its credentials in the URL (``https://user:token@host/org/repo``).
 		dest_folder (str|Path): Parent directory the clone goes under. Callers pass a
 			unique directory per input, so two repos with the same name never collide.
-		token (str|None): Access token for a private repo. Only sent over https.
 		depth (int): Clone depth (shallow by default).
 		timeout (int): Clone timeout in seconds.
 
@@ -104,21 +78,27 @@ def clone_git_repo(url, dest_folder, token=None, depth=1, timeout=300):
 	if target.exists():
 		shutil.rmtree(target, ignore_errors=True)
 
-	# GIT_TERMINAL_PROMPT=0 fails fast on a private repo with no/bad token instead of hanging.
+	# GIT_TERMINAL_PROMPT=0 fails fast on a private repo with no/bad credentials instead of hanging.
 	env = {**os.environ, 'GIT_TERMINAL_PROMPT': '0'}
-	if token:
-		if not url.startswith('https://'):
-			raise RuntimeError('a git token is only sent over https')
-		env.update(_token_auth_env(url, token))
-	proc = subprocess.run(
-		['git', 'clone', '--depth', str(depth), '--quiet', '--', url, str(target)],
-		capture_output=True, text=True, timeout=timeout, env=env,
-	)
+	try:
+		proc = subprocess.run(
+			['git', 'clone', '--depth', str(depth), '--quiet', '--', url, str(target)],
+			capture_output=True, text=True, timeout=timeout, env=env,
+		)
+	except subprocess.TimeoutExpired:
+		# The exception's message embeds the command line, URL credentials included.
+		raise RuntimeError(f'git clone of {redact_url_credentials(url)} timed out after {timeout}s') from None
 	if proc.returncode != 0:
-		err = (proc.stderr or '').strip()
-		if token:
-			err = err.replace(token, '***')  # never leak the token in an error
-		raise RuntimeError(f'git clone failed ({err})')
+		err = redact_url_credentials((proc.stderr or '').strip())
+		raise RuntimeError(f'git clone of {redact_url_credentials(url)} failed ({err})')
+	clean_url = strip_url_credentials(url)
+	if clean_url != url:
+		# git keeps the clone URL as remote.origin.url in .git/config: drop the credentials so
+		# they don't persist on disk where the scanning tool (e.g. a secret scanner) reads.
+		subprocess.run(
+			['git', '-C', str(target), 'remote', 'set-url', 'origin', clean_url],
+			capture_output=True, text=True, timeout=60, env=env,
+		)
 	return str(target)
 
 
