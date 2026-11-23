@@ -3,15 +3,17 @@
 A task that only accepts a local path (grype, trivy, gitleaks, ...) can't scan a repo
 URL directly. This clones the repo shallowly to a local directory so the tool runs on
 it. Tasks that handle remote URLs themselves (``URL`` in ``input_types``, e.g.
-trufflehog) are left to do so. Optional token auth for private repos, kept out of the
-clone's stored remote so a secret scanner won't flag it and it never persists.
+trufflehog) are left to do so. Optional token auth for private https repos: the token
+is passed to git through its environment as an auth header scoped to the repo's host,
+so it never appears in the process arguments or in the clone's ``.git/config``.
 """
+import base64
 import os
 import re
 import shutil
 import subprocess
 from pathlib import Path
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse
 
 GIT_HOSTS = ('github.com', 'gitlab.com', 'bitbucket.org')
 
@@ -40,13 +42,32 @@ def _repo_slug(url):
 	return re.sub(r'[^A-Za-z0-9._-]', '_', name) or 'repo'
 
 
-def _split_token(url, token):
-	"""Return (clone_url_with_token, clean_url) for an https URL."""
+def git_url_host(url):
+	"""Host a git URL points at (``None`` if it can't be parsed)."""
+	s = url.strip()
+	if s.startswith('git@'):  # scp-like ssh syntax: git@host:owner/repo
+		return s[len('git@'):].split(':', 1)[0].lower() or None
+	try:
+		return (urlparse(s).hostname or '').lower() or None
+	except ValueError:
+		return None
+
+
+def _token_auth_env(url, token):
+	"""Git env config sending ``token`` as Basic auth, only to ``url``'s https origin.
+
+	``token`` is either a bare token (sent as the username, as git does for
+	``https://<token>@host``) or ``user:token`` for hosts that need a specific username.
+	"""
 	u = urlparse(url)
-	netloc = u.hostname + (f':{u.port}' if u.port else '')
-	clean = urlunparse((u.scheme, netloc, u.path, '', '', ''))
-	tokened = urlunparse((u.scheme, f'{token}@{netloc}', u.path, '', '', ''))
-	return tokened, clean
+	origin = f'https://{u.hostname}' + (f':{u.port}' if u.port else '') + '/'
+	cred = token if ':' in token else f'{token}:'
+	header = 'Authorization: Basic ' + base64.b64encode(cred.encode()).decode()
+	return {
+		'GIT_CONFIG_COUNT': '1',
+		'GIT_CONFIG_KEY_0': f'http.{origin}.extraHeader',
+		'GIT_CONFIG_VALUE_0': header,
+	}
 
 
 def clone_git_repo(url, dest_folder, token=None, depth=1, timeout=300):
@@ -54,8 +75,9 @@ def clone_git_repo(url, dest_folder, token=None, depth=1, timeout=300):
 
 	Args:
 		url (str): Repository URL (https, or ssh via an agent).
-		dest_folder (str|Path): Parent directory the clone goes under.
-		token (str|None): Access token for a private https repo.
+		dest_folder (str|Path): Parent directory the clone goes under. Callers pass a
+			unique directory per input, so two repos with the same name never collide.
+		token (str|None): Access token for a private repo. Only sent over https.
 		depth (int): Clone depth (shallow by default).
 		timeout (int): Clone timeout in seconds.
 
@@ -68,14 +90,14 @@ def clone_git_repo(url, dest_folder, token=None, depth=1, timeout=300):
 	if target.exists():
 		shutil.rmtree(target, ignore_errors=True)
 
-	clone_url, clean_url = url, url
-	if token and url.startswith(('http://', 'https://')):
-		clone_url, clean_url = _split_token(url, token)
-
 	# GIT_TERMINAL_PROMPT=0 fails fast on a private repo with no/bad token instead of hanging.
 	env = {**os.environ, 'GIT_TERMINAL_PROMPT': '0'}
+	if token:
+		if not url.startswith('https://'):
+			raise RuntimeError('a git token is only sent over https')
+		env.update(_token_auth_env(url, token))
 	proc = subprocess.run(
-		['git', 'clone', '--depth', str(depth), '--quiet', clone_url, str(target)],
+		['git', 'clone', '--depth', str(depth), '--quiet', '--', url, str(target)],
 		capture_output=True, text=True, timeout=timeout, env=env,
 	)
 	if proc.returncode != 0:
@@ -83,12 +105,6 @@ def clone_git_repo(url, dest_folder, token=None, depth=1, timeout=300):
 		if token:
 			err = err.replace(token, '***')  # never leak the token in an error
 		raise RuntimeError(f'git clone failed ({err})')
-
-	# Strip the token from the stored remote so a secret scanner won't flag it and it
-	# never lingers in .git/config.
-	if token:
-		subprocess.run(['git', '-C', str(target), 'remote', 'set-url', 'origin', clean_url],
-					   capture_output=True, text=True)
 	return str(target)
 
 
@@ -112,7 +128,7 @@ def is_archive_url(value):
 def resolve_gcs_archive(gs_url, dest_folder):
 	"""Download a ``gs://`` archive and extract it, returning the local dir to scan.
 
-	Used for uploaded code (a zip/tar the platform stored in GCS). The archive is
+	Used for uploaded code (a zip/tar stored in GCS). The archive is
 	downloaded into ``dest_folder``, extracted, then removed so a tool scans the code
 	rather than the archive blob. A single top-level directory (the usual archive layout)
 	is returned directly.

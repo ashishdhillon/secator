@@ -51,6 +51,9 @@ VALIDATORS = ['validate_input', 'validate_item']
 # serialized/printed runner state (see Runner.sensitive_opt_names).
 REDACTED_OPT_VALUE = '[REDACTED]'
 
+# Runner-level secret options that no task definition declares, always redacted.
+RUNNER_SENSITIVE_OPTS = {'git_token'}
+
 
 def format_runner_name(runner):
 	"""Format runner name."""
@@ -276,8 +279,10 @@ class Runner:
 
 		# Resolve a remote git source (a repo URL) to a local path for runners that only
 		# accept a path (so the path-only tool scans the clone). Runs before validation,
-		# which would otherwise drop the URL as an unsupported input type.
-		self._resolve_sources()
+		# which would otherwise drop the URL as an unsupported input type. Skipped on a dry
+		# run, which only prints the command and must not touch the network or disk.
+		if not self.dry_run:
+			self._resolve_sources()
 
 		# Check if input is valid
 		self.inputs_valid = self.run_validators('validate_input', self.inputs, sub='init')
@@ -361,7 +366,7 @@ class Runner:
 	@property
 	def resolved_opts(self):
 		opts = {k: v for k, v in self.run_opts.items() if v is not None and not k.startswith('print_') and not k.endswith('_') and k != 'env'}  # noqa: E501
-		sensitive = self.sensitive_opt_names
+		sensitive = self.sensitive_opt_names | RUNNER_SENSITIVE_OPTS
 		if sensitive:
 			opts = {k: (REDACTED_OPT_VALUE if (k in sensitive and v) else v) for k, v in opts.items()}
 		return opts
@@ -1570,13 +1575,13 @@ class Runner:
 		or trufflehog) handles the remote source itself and is left untouched; so is one
 		that accepts any type. Best-effort: a clone failure leaves the input as-is so
 		validation (or the tool) reports it. The token comes from the ``git_token`` run-opt
-		or the ``SECATOR_GIT_TOKEN`` env var.
+		only, and is used only when every git input points at the same host, so a token
+		meant for one host is never sent to another.
 		"""
-		import os
 		import uuid
 		from secator.definitions import URL
 		from secator.sources import (
-			clone_git_repo, is_archive_url, is_gcs_url, is_git_url, resolve_gcs_archive,
+			clone_git_repo, git_url_host, is_archive_url, is_gcs_url, is_git_url, resolve_gcs_archive,
 		)
 		if not self.inputs:
 			return
@@ -1589,7 +1594,14 @@ class Runner:
 		# Clone a git URL only for a task that does NOT accept url inputs itself (grype,
 		# trivy, gitleaks); a task that accepts url (e.g. trufflehog) clones natively.
 		clones_git = bool(input_types) and URL not in input_types
-		token = self.run_opts.get('git_token') or os.environ.get('SECATOR_GIT_TOKEN')
+		token = self.run_opts.get('git_token')
+		if token and clones_git:
+			hosts = {git_url_host(inp) for inp in self.inputs if is_git_url(inp)}
+			if len(hosts) > 1:
+				self._print(Warning(message=(
+					f'Not using git_token: git inputs span several hosts ({", ".join(sorted(map(str, hosts)))}); '
+					'run one host per runner to clone private repos')), rich=True)
+				token = None
 		# A unique sub-dir per resolve: sibling tasks of a workflow share one reports folder,
 		# so a fixed path would let concurrent tasks clobber each other's checkout.
 		resolved = []
